@@ -1,0 +1,301 @@
+#!/bin/bash
+# =============================================================
+# SISTEMA DE ADMINISTRACION FTP - LINUX (vsftpd)
+# =============================================================
+# Requiere: Ubuntu/Debian, ejecutar como root
+# Uso: sudo bash menu_ftp.sh
+# =============================================================
+
+# --- FUNCION: Crear estructura de carpetas y bind mounts ---
+crear_estructura_usuario() {
+    local usuario="$1"
+    local grupo="$2"
+    local USER_HOME="/home/$usuario"
+
+    mkdir -p "$USER_HOME/general"
+    mkdir -p "$USER_HOME/$grupo"
+    mkdir -p "$USER_HOME/$usuario"
+
+    # Bind mounts: espeja las carpetas compartidas dentro del home
+    if ! mountpoint -q "$USER_HOME/general"; then
+        mount --bind /srv/ftp/general "$USER_HOME/general"
+    fi
+    if ! mountpoint -q "$USER_HOME/$grupo"; then
+        mount --bind /srv/ftp/"$grupo" "$USER_HOME/$grupo"
+    fi
+
+    # Home: root como dueno (vsftpd chroot requiere que NO sea escribible por el usuario)
+    chown root:root "$USER_HOME"
+    chmod 755 "$USER_HOME"
+
+    # Carpeta general: usuario y grupo ftp pueden escribir
+    chown nobody:nogroup "$USER_HOME/general"
+    chmod 777 "$USER_HOME/general"
+
+    # Carpeta de grupo: todos los miembros del grupo pueden escribir
+    # Permisos de grupo: todos los miembros pueden leer, escribir y renombrar archivos
+    chown "$usuario":"$grupo" "$USER_HOME/$grupo"
+    chmod 775 "$USER_HOME/$grupo"
+
+    # Carpeta personal: solo el usuario
+    chown "$usuario":"$grupo" "$USER_HOME/$usuario"
+    chmod 700 "$USER_HOME/$usuario"
+}
+
+# --- FUNCION: Pantalla de titulo ---
+limpiar_pantalla() {
+    clear
+    echo "=========================================================="
+    echo "       SISTEMA DE ADMINISTRACION FTP (LINUX)              "
+    echo "=========================================================="
+}
+
+# --- Verificar que se ejecuta como root ---
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: ejecutar como root (sudo bash menu_ftp.sh)"
+    exit 1
+fi
+
+# --- MENU PRINCIPAL ---
+while true; do
+    limpiar_pantalla
+
+    if systemctl is-active --quiet vsftpd; then
+        echo -e "Estado del Servicio: \e[32mACTIVO (Online)\e[0m"
+    else
+        echo -e "Estado del Servicio: \e[31mINACTIVO (Offline)\e[0m"
+    fi
+
+    echo "----------------------------------------------------------"
+    echo "1. CONFIGURACION INICIAL (Instalar/Configurar)"
+    echo "2. CREAR NUEVOS USUARIOS"
+    echo "3. CAMBIAR USUARIO DE GRUPO"
+    echo "4. LISTAR USUARIOS Y GRUPOS"
+    echo "5. ELIMINAR USUARIO"
+    echo "6. REINICIAR VSFTPD"
+    echo "7. SALIR"
+    echo "----------------------------------------------------------"
+    read -p "Seleccione una opcion [1-7]: " opcion
+
+    case $opcion in
+
+        1)
+            echo ""
+            echo "--- Verificando instalacion ---"
+            if dpkg -l | grep -q "^ii.*vsftpd"; then
+                echo "vsftpd ya esta instalado."
+            else
+                echo "Instalando vsftpd..."
+                apt update && apt install -y vsftpd
+            fi
+
+            # Crear grupos del sistema
+            groupadd -f reprobados
+            groupadd -f recursadores
+            groupadd -f ftp
+
+            # Crear directorios base del servidor FTP
+            mkdir -p /srv/ftp/general
+            mkdir -p /srv/ftp/reprobados
+            mkdir -p /srv/ftp/recursadores
+
+            # Permisos de carpetas compartidas en el servidor
+            # general: escribible por el grupo ftp (usuarios autenticados)
+            chown nobody:nogroup /srv/ftp/general
+            chmod 777 /srv/ftp/general
+
+            # reprobados y recursadores: escribible solo por su grupo
+            chown root:reprobados /srv/ftp/reprobados
+            chmod 775 /srv/ftp/reprobados
+
+            chown root:recursadores /srv/ftp/recursadores
+            chmod 775 /srv/ftp/recursadores
+
+            # Crear directorio aislado para anonimos (solo ve carpeta general)
+            mkdir -p /srv/ftp/anon_root/general
+            if ! mountpoint -q /srv/ftp/anon_root/general; then
+                mount --bind /srv/ftp/general /srv/ftp/anon_root/general
+            fi
+
+            chown root:root /srv/ftp/anon_root
+            chmod 755 /srv/ftp/anon_root
+            chown nobody:nogroup /srv/ftp/anon_root/general
+            chmod 755 /srv/ftp/anon_root/general
+
+            # Escribir configuracion vsftpd
+            cat > /etc/vsftpd.conf << 'VSFTPD_CONF'
+listen=YES
+listen_ipv6=NO
+
+# Acceso anonimo: ve SOLO /srv/ftp/anon_root (unicamente carpeta general)
+anonymous_enable=YES
+anon_root=/srv/ftp/anon_root
+no_anon_password=YES
+anon_upload_enable=NO
+anon_mkdir_write_enable=NO
+anon_other_write_enable=NO
+anon_world_readable_only=YES
+
+# Acceso usuarios locales
+local_enable=YES
+write_enable=YES
+local_umask=022
+
+# Chroot: cada usuario queda encerrado en su home
+chroot_local_user=YES
+allow_writeable_chroot=YES
+
+# Configuracion general
+ftpd_banner=Bienvenido al servidor FTP de Sistemas.
+use_localtime=YES
+xferlog_enable=YES
+
+# Modo pasivo para FileZilla (necesario detras de NAT)
+pasv_enable=YES
+pasv_min_port=40000
+pasv_max_port=50000
+VSFTPD_CONF
+
+            # Abrir puertos si ufw esta activo
+            if ufw status 2>/dev/null | grep -q "active"; then
+                ufw allow 21/tcp
+                ufw allow 40000:50000/tcp
+                echo "Puertos FTP abiertos en firewall."
+            fi
+
+            systemctl enable vsftpd
+            systemctl restart vsftpd
+
+            echo ""
+            echo "Configuracion completada. Estado: $(systemctl is-active vsftpd)"
+            read -p "Presione Enter para volver..."
+            ;;
+
+        2)
+            read -p "Cuantos usuarios desea crear?: " n
+
+            for ((i=1; i<=n; i++)); do
+                echo ""
+                echo "--- Usuario $i de $n ---"
+                read -p "Nombre de usuario: " usuario
+                read -s -p "Contrasena: " pass
+                echo ""
+                read -p "Grupo (reprobados/recursadores): " grupo
+
+                if [ "$grupo" != "reprobados" ] && [ "$grupo" != "recursadores" ]; then
+                    echo "Grupo invalido. Debe ser 'reprobados' o 'recursadores'."
+                    continue
+                fi
+
+                # Crear usuario si no existe
+                if id "$usuario" &>/dev/null; then
+                    echo "El usuario $usuario ya existe, actualizando contrasena."
+                else
+                    useradd -m -s /bin/bash -g "$grupo" "$usuario"
+                fi
+
+                echo "$usuario:$pass" | chpasswd
+
+                # Agregar al grupo ftp para acceso a carpeta general
+                usermod -aG ftp "$usuario"
+
+                # Crear estructura de directorios y montar
+                crear_estructura_usuario "$usuario" "$grupo"
+
+                echo "Usuario $usuario creado en grupo $grupo."
+            done
+
+            read -p "Proceso terminado. Enter para continuar..."
+            ;;
+
+        3)
+            read -p "Nombre del usuario a cambiar de grupo: " user_change
+
+            if ! id "$user_change" &>/dev/null; then
+                echo "El usuario $user_change no existe."
+                read -p "Presione Enter..."
+                continue
+            fi
+
+            grupo_actual=$(id -gn "$user_change")
+            echo "Grupo actual: $grupo_actual"
+            read -p "Nuevo grupo (reprobados/recursadores): " nuevo_grupo
+
+            if [ "$grupo_actual" = "$nuevo_grupo" ]; then
+                echo "El usuario ya pertenece a $nuevo_grupo."
+                read -p "Presione Enter..."
+                continue
+            fi
+
+            # Desmontar y eliminar carpeta del grupo anterior
+            umount -l /home/"$user_change"/"$grupo_actual" 2>/dev/null
+            rm -rf /home/"$user_change"/"$grupo_actual"
+
+            # Cambiar grupo principal
+            usermod -g "$nuevo_grupo" "$user_change"
+
+            # Crear y montar nueva carpeta de grupo
+            mkdir -p /home/"$user_change"/"$nuevo_grupo"
+            mount --bind /srv/ftp/"$nuevo_grupo" /home/"$user_change"/"$nuevo_grupo"
+            chown "$user_change":"$nuevo_grupo" /home/"$user_change"/"$nuevo_grupo"
+            chmod 775 /home/"$user_change"/"$nuevo_grupo"
+
+            echo "Cambio exitoso. $user_change ahora pertenece a $nuevo_grupo."
+            read -p "Presione Enter..."
+            ;;
+
+        4)
+            echo ""
+            echo "--- USUARIOS DEL SISTEMA ---"
+            awk -F: '$3 >= 1000 && $1 != "nobody" {print "  " $1}' /etc/passwd
+
+            echo ""
+            echo "--- MIEMBROS POR GRUPO ---"
+            echo -n "  reprobados:   "; getent group reprobados   | cut -d: -f4
+            echo -n "  recursadores: "; getent group recursadores | cut -d: -f4
+
+            echo ""
+            echo "--- BIND MOUNTS ACTIVOS ---"
+            mount | grep /srv/ftp | awk '{print "  " $3 " -> " $1}'
+
+            read -p "Presione Enter..."
+            ;;
+
+        5)
+            read -p "Usuario a ELIMINAR definitivamente: " user_del
+
+            if ! id "$user_del" &>/dev/null; then
+                echo "El usuario $user_del no existe."
+                read -p "Presione Enter..."
+                continue
+            fi
+
+            # Desmontar bind mounts
+            umount -l /home/"$user_del"/general    2>/dev/null
+            umount -l /home/"$user_del"/reprobados  2>/dev/null
+            umount -l /home/"$user_del"/recursadores 2>/dev/null
+
+            # Eliminar usuario y home
+            userdel -r "$user_del" 2>/dev/null
+
+            echo "Usuario $user_del eliminado."
+            read -p "Presione Enter..."
+            ;;
+
+        6)
+            systemctl restart vsftpd
+            echo "Servicio reiniciado. Estado: $(systemctl is-active vsftpd)"
+            sleep 2
+            ;;
+
+        7)
+            echo "Saliendo..."
+            exit 0
+            ;;
+
+        *)
+            echo "Opcion no valida."
+            sleep 1
+            ;;
+    esac
+done
